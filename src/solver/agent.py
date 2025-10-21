@@ -5,7 +5,7 @@ import json
 import time
 from typing import List, Dict, Any, Optional, Set, Tuple
 from collections import defaultdict
-from openai import AzureOpenAI
+from openai import AzureOpenAI, RateLimitError
 
 from src.crossword.crossword import CrosswordPuzzle
 from src.crossword.types import Clue, Direction
@@ -252,7 +252,8 @@ class CrosswordAgent:
                 return {"valid": False, "message": "Clue not found"}
 
             is_valid = self.puzzle.validate_clue_chars(clue)
-            current_answer = ''.join(self.puzzle.get_current_clue_chars(clue))
+            current_chars = self.puzzle.get_current_clue_chars(clue)
+            current_answer = ''.join(ch if ch is not None else '_' for ch in current_chars)
 
             return {
                 "valid": is_valid,
@@ -350,7 +351,7 @@ class CrosswordAgent:
         """Build the system prompt with strategy guidance."""
         return """You are an expert crossword-solving agent with access to tools.
 
-Your task: Solve the crossword puzzle completely using the provided tools.
+Your task: Solve the crossword puzzle COMPLETELY using the provided tools.
 
 STRATEGY FOR SUCCESS:
 1. Start with clues you're most confident about
@@ -358,17 +359,24 @@ STRATEGY FOR SUCCESS:
 3. After set_answer, IMMEDIATELY use validate_clue to verify
 4. If validation fails, use undo_last and try a different answer
 5. Use get_constraints to see what letters are required from intersecting clues
-6. Use get_current_grid periodically to see progress
-7. When you think you're done, use validate_all to confirm
-8. If the puzzle is not yet solved, continue to use the tools
+6. Prioritize clues that have constraints (letters already filled from intersections)
+7. Use get_current_grid periodically to see progress and reassess strategy
 
-IMPORTANT RULES:
-- You MUST use the tools - do not guess if answers are correct
+CRITICAL PERSISTENCE RULES:
+- You MUST continue trying until validate_all returns True
+- If stuck on a clue after 2-3 failed attempts, MOVE TO A DIFFERENT CLUE
+- Come back to difficult clues after solving easier ones (more constraints will help)
+- NEVER stop using tools until the puzzle is complete
+- If you're unsure, use get_current_grid to see what's been filled
+- After solving new clues, revisit previously difficult ones - they may be easier now
+
+TOOL USAGE REQUIREMENTS:
+- You MUST use tools - do not just describe what you would do
 - Always check intersections before committing an answer
-- If you've tried an answer before and it failed, don't try it again
-- Work systematically - validate each answer before moving to the next
+- Work systematically through all clues
+- Keep trying different answers until validation succeeds
 
-Continue until validate_all returns True."""
+Continue working until validate_all returns True. Do not stop before then."""
 
     def _compress_conversation(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Compress conversation history to prevent context bloat."""
@@ -422,27 +430,49 @@ Continue solving the remaining clues. Remember to use check_intersection before 
         for iteration in range(self.max_iterations):
             self.iterations = iteration + 1
 
+            # Small delay to avoid rate limits (skip first iteration)
+            if iteration > 0:
+                time.sleep(0.5)
+
             # Compress conversation if getting too long
             if iteration > 0 and iteration % 15 == 0:
                 messages = self._compress_conversation(messages)
                 if verbose:
                     print(f"\n[Iteration {iteration}] Compressing conversation history...\n")
 
-            # Call LLM with tools
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                tools=tools,
-                tool_choice="auto"
-            )
+            # Call LLM with tools (with retry for rate limits)
+            max_retries = 3
+            retry_delay = 2.0
+
+            for attempt in range(max_retries):
+                try:
+                    response = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                        tools=tools,
+                        tool_choice="auto"
+                    )
+                    break  # Success, exit retry loop
+                except RateLimitError as e:
+                    if attempt < max_retries - 1:
+                        if verbose:
+                            print(f"\n⚠️ Rate limit hit, waiting {retry_delay}s...\n")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                    else:
+                        raise  # Final attempt failed, re-raise
 
             response_message = response.choices[0].message
 
             # Add assistant's response to conversation
-            messages.append({
+            assistant_message = {
                 "role": "assistant",
                 "content": response_message.content,
-                "tool_calls": [
+            }
+
+            # Only add tool_calls if there are any (empty array causes API error)
+            if response_message.tool_calls:
+                assistant_message["tool_calls"] = [
                     {
                         "id": tc.id,
                         "type": tc.type,
@@ -451,9 +481,10 @@ Continue solving the remaining clues. Remember to use check_intersection before 
                             "arguments": tc.function.arguments
                         }
                     }
-                    for tc in (response_message.tool_calls or [])
+                    for tc in response_message.tool_calls
                 ]
-            })
+
+            messages.append(assistant_message)
 
             # Check if agent wants to use tools
             if response_message.tool_calls:
@@ -498,7 +529,7 @@ Continue solving the remaining clues. Remember to use check_intersection before 
             else:
                 # Agent didn't call any tools - it might think it's done or stuck
                 if verbose:
-                    print(f"Agent response: {response_message.content}")
+                    print(f"💭 Agent thinking: {response_message.content}\n")
 
                 # Double-check if actually solved
                 if self.puzzle.validate_all():
@@ -513,10 +544,23 @@ Continue solving the remaining clues. Remember to use check_intersection before 
                         print(f"{'='*60}\n")
                     return True
 
-                # Not solved and no tool calls - agent might be stuck
+                # Not solved - prompt agent to continue with tools
+                filled = sum(1 for c in self.puzzle.clues if c.answered)
+                total = len(self.puzzle.clues)
+
+                reminder = f"""The puzzle is NOT complete yet ({filled}/{total} clues solved).
+
+You must continue using tools to solve remaining clues. Use get_current_grid to see progress, then continue solving. Remember:
+- Try clues with constraints (intersecting letters already filled)
+- If stuck on a clue, try a different one
+- Keep working until validate_all returns True
+
+Continue now with a tool call."""
+
+                messages.append({"role": "user", "content": reminder})
+
                 if verbose:
-                    print("\n⚠️ Agent stopped without solving. Checking state...\n")
-                break
+                    print(f"⚠️ Agent tried to stop early ({filled}/{total} solved). Prompting to continue...\n")
 
         # Max iterations reached
         if verbose:
