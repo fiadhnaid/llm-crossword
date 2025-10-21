@@ -11,6 +11,14 @@ from src.crossword.crossword import CrosswordPuzzle
 from src.crossword.types import Clue, Direction
 
 
+class SolverPhase:
+    """Solver phases for strategic crossword solving"""
+    CONSTRAINED_SOLVING = 1  # Solve clues with existing constraints
+    CANDIDATE_GENERATION = 2  # Generate candidates for ambiguous clues
+    CONSTRAINT_PROPAGATION = 3  # Use constraint propagation to narrow down
+    BACKTRACKING = 4  # Systematic backtracking when stuck
+
+
 class CrosswordAgent:
     """An LLM agent that solves crosswords using tools for validation and self-correction."""
 
@@ -27,6 +35,14 @@ class CrosswordAgent:
         # Performance tracking
         self.start_time = None
         self.iterations = 0
+
+        # Phase tracking for multi-phase solving strategy
+        self.current_phase = SolverPhase.CONSTRAINED_SOLVING
+        self.iterations_without_progress = 0
+        self.last_filled_count = 0
+
+        # Candidate cache: (clue_number, direction) -> List[str]
+        self.candidate_cache: Dict[Tuple[int, str], List[str]] = {}
 
     def _define_tools(self) -> List[Dict[str, Any]]:
         """Define the tools available to the agent."""
@@ -162,6 +178,33 @@ class CrosswordAgent:
                         "required": []
                     }
                 }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "generate_candidates",
+                    "description": "Generate multiple possible answers for a clue. Use this when you're uncertain or want to explore options before committing.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "clue_number": {
+                                "type": "integer",
+                                "description": "The clue number"
+                            },
+                            "direction": {
+                                "type": "string",
+                                "enum": ["across", "down"],
+                                "description": "The direction of the clue"
+                            },
+                            "count": {
+                                "type": "integer",
+                                "description": "Number of candidates to generate (default 5, max 10)",
+                                "default": 5
+                            }
+                        },
+                        "required": ["clue_number", "direction"]
+                    }
+                }
             }
         ]
 
@@ -217,6 +260,102 @@ class CrosswordAgent:
                 constraints[i] = current_value
 
         return constraints
+
+    def _generate_candidates(self, clue: Clue, count: int = 5) -> List[Dict[str, Any]]:
+        """
+        Generate multiple candidate answers for a clue using LLM.
+        Returns list of candidates with compatibility scores.
+        """
+        # Check cache first
+        cache_key = (clue.number, clue.direction.value)
+        if cache_key in self.candidate_cache:
+            cached = self.candidate_cache[cache_key]
+            return [{"candidate": c, "compatible": True, "score": 1.0} for c in cached[:count]]
+
+        # Get current constraints
+        constraints = self._get_constraints_for_clue(clue)
+
+        # Build constraint string for prompt
+        constraint_str = ""
+        if constraints:
+            constraint_pattern = "_" * clue.length
+            for pos, letter in constraints.items():
+                constraint_pattern = constraint_pattern[:pos] + letter + constraint_pattern[pos+1:]
+            constraint_str = f"\nKnown letters: {constraint_pattern}"
+
+        # Create prompt for candidate generation
+        prompt = f"""Generate {count} DIFFERENT possible answers for this crossword clue.
+
+Clue: {clue.text}
+Length: {clue.length} letters{constraint_str}
+
+Requirements:
+- Each answer must be EXACTLY {clue.length} letters
+- Answers must be DIFFERENT from each other
+- Consider the difficulty level (this may require creative thinking)
+- If constraints are given, answers MUST match those letter positions
+
+Return ONLY a JSON array of strings, like: ["ANSWER1", "ANSWER2", "ANSWER3"]
+No explanations, just the JSON array."""
+
+        try:
+            # Call LLM to generate candidates
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a crossword expert. Generate diverse, valid answers."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.8,  # Higher temperature for diversity
+                max_tokens=200
+            )
+
+            # Parse response
+            content = response.choices[0].message.content.strip()
+            candidates = json.loads(content)
+
+            # Validate and filter candidates
+            valid_candidates = []
+            for candidate in candidates:
+                candidate = candidate.upper().strip()
+
+                # Check length
+                if len(candidate) != clue.length:
+                    continue
+
+                # Check constraints compatibility
+                result = self._check_intersection_compatible(clue, candidate)
+                if result['compatible']:
+                    valid_candidates.append({
+                        "candidate": candidate,
+                        "compatible": True,
+                        "score": 1.0,
+                        "constraints_satisfied": len(constraints)
+                    })
+                else:
+                    # Include incompatible but note the issues
+                    valid_candidates.append({
+                        "candidate": candidate,
+                        "compatible": False,
+                        "score": 0.0,
+                        "conflicts": result.get('conflicts', [])
+                    })
+
+            # Cache the valid compatible candidates
+            compatible_only = [c["candidate"] for c in valid_candidates if c["compatible"]]
+            if compatible_only:
+                self.candidate_cache[cache_key] = compatible_only
+
+            return valid_candidates[:count]
+
+        except Exception as e:
+            # Fallback: return empty list with error
+            return [{
+                "error": f"Failed to generate candidates: {str(e)}",
+                "candidate": "",
+                "compatible": False,
+                "score": 0.0
+            }]
 
     def _execute_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Execute a tool call and return the result."""
@@ -326,6 +465,34 @@ class CrosswordAgent:
                 "message": f"Grid state: {len(filled_clues)}/{len(self.puzzle.clues)} clues filled"
             }
 
+        elif tool_name == "generate_candidates":
+            clue = self._find_clue(arguments['clue_number'], arguments['direction'])
+            if not clue:
+                return {"candidates": [], "message": "Clue not found"}
+
+            count = arguments.get('count', 5)
+            count = min(count, 10)  # Cap at 10
+
+            candidates_data = self._generate_candidates(clue, count)
+
+            # Format results for display
+            compatible = [c for c in candidates_data if c.get('compatible', False)]
+            incompatible = [c for c in candidates_data if not c.get('compatible', False)]
+
+            message_parts = [f"Generated {len(candidates_data)} candidates for {arguments['clue_number']}-{arguments['direction']}:"]
+
+            if compatible:
+                message_parts.append(f"\nCompatible ({len(compatible)}): {', '.join(c['candidate'] for c in compatible)}")
+
+            if incompatible:
+                message_parts.append(f"\nIncompatible ({len(incompatible)}): {', '.join(c['candidate'] for c in incompatible if c.get('candidate'))}")
+
+            return {
+                "candidates": candidates_data,
+                "compatible_count": len(compatible),
+                "message": " ".join(message_parts)
+            }
+
         else:
             return {"error": f"Unknown tool: {tool_name}"}
 
@@ -348,44 +515,125 @@ class CrosswordAgent:
         return "\n".join(lines)
 
     def _build_system_prompt(self) -> str:
-        """Build the system prompt with strategy guidance."""
-        return """You are an expert crossword-solving agent with access to tools.
+        """Build the system prompt with multi-phase strategy guidance."""
+        phase_name = {
+            SolverPhase.CONSTRAINED_SOLVING: "CONSTRAINED SOLVING",
+            SolverPhase.CANDIDATE_GENERATION: "CANDIDATE GENERATION",
+            SolverPhase.CONSTRAINT_PROPAGATION: "CONSTRAINT PROPAGATION",
+            SolverPhase.BACKTRACKING: "BACKTRACKING"
+        }.get(self.current_phase, "SOLVING")
+
+        return f"""You are an expert crossword-solving agent with access to tools.
 
 Your task: Solve the crossword puzzle COMPLETELY using the provided tools.
 
-STRATEGY FOR SUCCESS:
-1. Start with clues you're most confident about
-2. ALWAYS use check_intersection BEFORE set_answer to avoid conflicts
-3. After set_answer, IMMEDIATELY use validate_clue to verify
-4. If validation fails, use undo_last and try a different answer
-5. Use get_constraints to see what letters are required from intersecting clues
-6. Prioritize clues that have constraints (letters already filled from intersections)
-7. Use get_current_grid periodically to see progress and reassess strategy
+=== CURRENT PHASE: {phase_name} ===
 
-CRITICAL PERSISTENCE RULES:
-- You MUST continue trying until validate_all returns True
-- If stuck on a clue after 2-3 failed attempts, MOVE TO A DIFFERENT CLUE
-- Come back to difficult clues after solving easier ones (more constraints will help)
-- NEVER stop using tools until the puzzle is complete
-- If you're unsure, use get_current_grid to see what's been filled
-- After solving new clues, revisit previously difficult ones - they may be easier now
+MULTI-PHASE SOLVING STRATEGY:
 
-TOOL USAGE REQUIREMENTS:
-- You MUST use tools - do not just describe what you would do
-- Always check intersections before committing an answer
-- Work systematically through all clues
-- Keep trying different answers until validation succeeds
+PHASE 1 - CONSTRAINED SOLVING (Early game):
+- Focus on clues that have letter constraints from intersecting answers
+- Use get_constraints to identify which clues have the most known letters
+- Solve high-confidence clues with constraints first
+- Build up the grid systematically from areas with most information
 
-Continue working until validate_all returns True. Do not stop before then."""
+PHASE 2 - CANDIDATE GENERATION (When stuck):
+- Use generate_candidates to explore multiple possibilities for difficult clues
+- Generate candidates for 2-3 clues before committing
+- Compare candidates and choose the one that creates fewest conflicts
+- This helps when you're uncertain about a single answer
+
+PHASE 3 - CONSTRAINT PROPAGATION (Mid-game):
+- After setting an answer, immediately check what new constraints it creates
+- Use get_constraints on intersecting clues to see downstream effects
+- Solve clues that now have more constraints
+- Look for cascading solutions where one answer unlocks several others
+
+PHASE 4 - BACKTRACKING (When conflicts arise):
+- If multiple validations fail, identify which earlier answer might be wrong
+- Use undo_last to remove suspect answers
+- Try alternative candidates from your earlier generation
+- Work backwards from conflicts to find root cause
+
+CORE TOOL USAGE:
+1. check_intersection BEFORE set_answer (avoid conflicts)
+2. validate_clue IMMEDIATELY after set_answer (verify correctness)
+3. generate_candidates for uncertain clues (explore options)
+4. get_constraints to find clues with most known letters (prioritization)
+5. get_current_grid periodically (assess progress and strategy)
+
+CRITICAL RULES:
+- MUST continue until validate_all returns True
+- If stuck on a clue after 2-3 attempts, MOVE TO A DIFFERENT CLUE
+- Use generate_candidates when uncertain rather than guessing blindly
+- After solving new clues, revisit difficult ones (they may have more constraints now)
+- NEVER stop using tools until puzzle is complete
+
+Work systematically and persistently. Continue until validate_all returns True."""
+
+    def _update_phase(self) -> Optional[str]:
+        """
+        Update the solving phase based on current progress.
+        Returns a message if phase changed, None otherwise.
+        """
+        filled_count = sum(1 for c in self.puzzle.clues if c.answered)
+        total_count = len(self.puzzle.clues)
+        progress_made = filled_count > self.last_filled_count
+
+        # Update progress tracking
+        if progress_made:
+            self.iterations_without_progress = 0
+            self.last_filled_count = filled_count
+        else:
+            self.iterations_without_progress += 1
+
+        old_phase = self.current_phase
+
+        # Phase transition logic
+        if self.current_phase == SolverPhase.CONSTRAINED_SOLVING:
+            # Move to candidate generation if stuck (no progress for 5 iterations)
+            if self.iterations_without_progress >= 5:
+                self.current_phase = SolverPhase.CANDIDATE_GENERATION
+
+        elif self.current_phase == SolverPhase.CANDIDATE_GENERATION:
+            # Move to constraint propagation if making progress again
+            if progress_made:
+                self.current_phase = SolverPhase.CONSTRAINT_PROPAGATION
+            # Or to backtracking if stuck too long
+            elif self.iterations_without_progress >= 10:
+                self.current_phase = SolverPhase.BACKTRACKING
+
+        elif self.current_phase == SolverPhase.CONSTRAINT_PROPAGATION:
+            # Move to backtracking if stuck
+            if self.iterations_without_progress >= 5:
+                self.current_phase = SolverPhase.BACKTRACKING
+            # Back to constrained solving if making good progress
+            elif filled_count - self.last_filled_count > 2:
+                self.current_phase = SolverPhase.CONSTRAINED_SOLVING
+
+        elif self.current_phase == SolverPhase.BACKTRACKING:
+            # Back to candidate generation after some undos
+            if progress_made or self.iterations_without_progress >= 8:
+                self.current_phase = SolverPhase.CANDIDATE_GENERATION
+
+        # Generate transition message if phase changed
+        if old_phase != self.current_phase:
+            phase_names = {
+                SolverPhase.CONSTRAINED_SOLVING: "CONSTRAINED SOLVING",
+                SolverPhase.CANDIDATE_GENERATION: "CANDIDATE GENERATION",
+                SolverPhase.CONSTRAINT_PROPAGATION: "CONSTRAINT PROPAGATION",
+                SolverPhase.BACKTRACKING: "BACKTRACKING"
+            }
+            return f"\n🔄 PHASE TRANSITION: {phase_names[old_phase]} → {phase_names[self.current_phase]}\n"
+
+        return None
 
     def _compress_conversation(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Compress conversation history to prevent context bloat."""
         if len(messages) < 50:
             return messages
 
-        # Keep system message and create a summary
-        system_msg = messages[0]
-
+        # Keep system message but rebuild it with current phase
         filled_clues = [f"{c.number}-{c.direction.value}" for c in self.puzzle.clues if c.answered]
         remaining_clues = [f"{c.number}-{c.direction.value}" for c in self.puzzle.clues if not c.answered]
 
@@ -394,10 +642,10 @@ Continue working until validate_all returns True. Do not stop before then."""
 - Remaining clues: {', '.join(remaining_clues)}
 - Grid:\n{str(self.puzzle)}
 
-Continue solving the remaining clues. Remember to use check_intersection before set_answer."""
+Continue solving the remaining clues. Remember to use the multi-phase strategy and check_intersection before set_answer."""
 
         return [
-            system_msg,
+            {"role": "system", "content": self._build_system_prompt()},
             {"role": "user", "content": summary}
         ]
 
@@ -433,6 +681,11 @@ Continue solving the remaining clues. Remember to use check_intersection before 
             # Small delay to avoid rate limits (skip first iteration)
             if iteration > 0:
                 time.sleep(0.5)
+
+            # Update phase based on progress
+            phase_message = self._update_phase()
+            if phase_message and verbose:
+                print(phase_message)
 
             # Compress conversation if getting too long
             if iteration > 0 and iteration % 15 == 0:
